@@ -12,40 +12,12 @@ env:
   USE_GKE_GCLOUD_AUTH_PLUGIN: "True"
 
 jobs:
-  provision-gke:
-    runs-on: ubuntu-latest
-    environment: Cortex
-    steps:
-      - name: Authenticate to GCP
-        uses: google-github-actions/auth@v2
-        with:
-          credentials_json: ${{ secrets.GCP_KEY }}
-
-      - name: Set up Cloud SDK
-        uses: google-github-actions/setup-gcloud@v2
-
-      - name: Provision GKE Cluster
-        run: |
-          gcloud config set project "${{ vars.GCP_PROJECT_NAME }}"
-          if ! gcloud container clusters describe "${{ vars.CLUSTER_NAME }}" --region "${{ env.REGION }}" >/dev/null 2>&1; then
-            echo "Creating cluster..."
-            gcloud container clusters create "${{ vars.CLUSTER_NAME }}" \
-              --region "${{ env.REGION }}" \
-              --num-nodes 2 \
-              --enable-ip-alias \
-              --quiet
-          else
-            echo "Cluster already exists."
-          fi
-
   healthcheck:
-    needs: provision-gke
     runs-on: ubuntu-latest
     environment: Cortex
     steps:
       - name: XDR API Healthcheck
         env:
-          # Mapping secrets locally within the job so they are available to the shell
           XDR_URL: ${{ secrets.XDR_URL }}
           AUTH_ID: ${{ secrets.AUTH_ID }}
           AUTH_TOKEN: ${{ secrets.AUTH_TOKEN }}
@@ -108,7 +80,7 @@ jobs:
           path: ${{ env.PACKAGE_NAME }}
 
   deploy:
-    needs: [provision-gke, distribution]
+    needs: distribution
     runs-on: ubuntu-latest
     environment: Cortex
     steps:
@@ -117,7 +89,7 @@ jobs:
         with:
           name: xdr-package
 
-      - name: Authenticate to GCP
+      - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v2
         with:
           credentials_json: ${{ secrets.GCP_KEY }}
