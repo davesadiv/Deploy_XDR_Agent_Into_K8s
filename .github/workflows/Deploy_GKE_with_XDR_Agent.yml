@@ -104,20 +104,22 @@ jobs:
 
       - name: Apply XDR configurations
         run: |
-          # Adding --insecure-skip-tls-verify to all kubectl commands
           kubectl create namespace cortex-xdr --dry-run=client -o yaml | kubectl apply -f - --insecure-skip-tls-verify
-          
           kubectl apply -f "$PACKAGE_NAME" --insecure-skip-tls-verify
           
-          echo "Waiting for XDR DaemonSet rollout (5m timeout)..."
-          if ! kubectl rollout status daemonset/cortex-agent -n cortex-xdr --timeout=300s --insecure-skip-tls-verify; then
-            echo "--- DEBUG INFO ---"
+          echo "Waiting for XDR DaemonSet rollout (Increased to 10m)..."
+          # 600 seconds gives the agent enough time to initialize and register
+          if ! kubectl rollout status daemonset/cortex-agent -n cortex-xdr --timeout=600s --insecure-skip-tls-verify; then
+            echo "--- TIMEOUT REACHED: INVESTIGATING AGENT INTERNAL STATUS ---"
+            
+            # Show the status of all pods
             kubectl get pods -n cortex-xdr --insecure-skip-tls-verify
             
-            # Identify specific pod failure reasons
+            # Get logs from one pod to see if it's struggling to connect to the XDR Console
             FAILING_POD=$(kubectl get pods -n cortex-xdr --no-headers -o custom-columns=":metadata.name" --insecure-skip-tls-verify | head -n 1)
-            kubectl describe pod "$FAILING_POD" -n cortex-xdr --insecure-skip-tls-verify
+            echo "Logs for $FAILING_POD:"
+            kubectl logs "$FAILING_POD" -n cortex-xdr --insecure-skip-tls-verify --tail=20
             
             exit 1
           fi
-          echo "✅ XDR Agent successfully deployed."
+          echo "✅ XDR Agent is active and ready on all nodes."
