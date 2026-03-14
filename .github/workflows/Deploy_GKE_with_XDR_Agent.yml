@@ -105,5 +105,5 @@ jobs:
       - name: Apply XDR configurations
           # The file itself contains sensitive connection info, so we apply and don't log it
         run: |
-          kubectl apply -f "$PACKAGE_NAME"
-          kubectl rollout status daemonset/cortex-agent -n cortex-xdr --timeout=150s
+          kubectl apply -f "$PACKAGE_NAME" --insecure-skip-tls-verify
+          kubectl rollout status daemonset/cortex-agent -n cortex-xdr --timeout=150s --insecure-skip-tls-verify
