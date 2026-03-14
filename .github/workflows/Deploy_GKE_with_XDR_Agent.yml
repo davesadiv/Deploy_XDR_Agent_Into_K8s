@@ -107,17 +107,19 @@ jobs:
           kubectl create namespace cortex-xdr --dry-run=client -o yaml | kubectl apply -f - --insecure-skip-tls-verify
           kubectl apply -f "$PACKAGE_NAME" --insecure-skip-tls-verify
           
-          echo "Checking pods..."
-          sleep 30 # Give them a moment to initialize
+          echo "Waiting 60s for initial stabilization..."
+          sleep 60
           
-          # This command shows us what's happening without failing the whole pipeline
-          # if a pod is stuck in Pending due to node count.
+          echo "Checking Pod Status..."
           kubectl get pods -n cortex-xdr --insecure-skip-tls-verify
           
-          # Instead of 'rollout status', we check if at least ONE pod is running
-          if [[ $(kubectl get pods -n cortex-xdr -l app=cortex-agent --field-selector=status.phase=Running --no-headers --insecure-skip-tls-verify | wc -l) -gt 0 ]]; then
-            echo "✅ At least one XDR agent is running successfully."
+          # This logic counts how many pods are actually "1/1" (Ready)
+          READY_COUNT=$(kubectl get pods -n cortex-xdr --insecure-skip-tls-verify --no-headers | grep "1/1" | wc -l)
+          
+          if [ "$READY_COUNT" -gt 0 ]; then
+            echo "✅ Success: $READY_COUNT XDR agent(s) are Ready and Running."
           else
-            echo "❌ No agents are running. Check logs."
+            echo "❌ Error: No agents reached Ready status. Check events/logs."
+            kubectl get events -n cortex-xdr --sort-by='.lastTimestamp' --insecure-skip-tls-verify | tail -n 5
             exit 1
           fi
