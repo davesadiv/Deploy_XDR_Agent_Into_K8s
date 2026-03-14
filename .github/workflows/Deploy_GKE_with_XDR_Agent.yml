@@ -103,7 +103,15 @@ jobs:
           project_id: ${{ vars.GCP_PROJECT_NAME }}
 
       - name: Apply XDR configurations
-          # The file itself contains sensitive connection info, so we apply and don't log it
         run: |
-          kubectl apply -f "$PACKAGE_NAME" --insecure-skip-tls-verify
-          kubectl rollout status daemonset/cortex-agent -n cortex-xdr --timeout=150s --insecure-skip-tls-verify
+          kubectl create namespace cortex-xdr --dry-run=client -o yaml | kubectl apply -f -
+          kubectl apply -f "$PACKAGE_NAME"
+          
+          echo "Waiting for rollout (increased timeout to 300s)..."
+          # Increased timeout to 5 minutes
+          if ! kubectl rollout status daemonset/cortex-agent -n cortex-xdr --timeout=300s; then
+            echo "Rollout timed out. Gathering debug info..."
+            kubectl get pods -n cortex-xdr --insecure-skip-tls-verify
+            kubectl describe daemonset cortex-agent -n cortex-xdr --insecure-skip-tls-verify
+            exit 1
+          fi
