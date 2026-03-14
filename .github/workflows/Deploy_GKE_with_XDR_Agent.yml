@@ -19,6 +19,7 @@ env:
 jobs:
   healthcheck:
     runs-on: ubuntu-latest
+    environment: Cortex
     steps:
       - name: XDR API Healthcheck
         run: |
@@ -32,6 +33,7 @@ jobs:
   distribution:
     needs: healthcheck
     runs-on: ubuntu-latest
+    environment: Cortex
     steps:
       - name: Generate XDR Package
         run: |
