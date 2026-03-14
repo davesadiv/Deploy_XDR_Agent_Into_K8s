@@ -9,7 +9,6 @@ env:
   REGION: "us-central1"
   OS_TYPE: "linux"
   PACKAGE_NAME: "xdrdaemonset.yaml"
-  USE_GKE_GCLOUD_AUTH_PLUGIN: "True"
 
 jobs:
   healthcheck:
@@ -18,6 +17,7 @@ jobs:
     steps:
       - name: XDR API Healthcheck
         env:
+          # Mapping secrets as ENV vars keeps them out of the log command history
           XDR_URL: ${{ secrets.XDR_URL }}
           AUTH_ID: ${{ secrets.AUTH_ID }}
           AUTH_TOKEN: ${{ secrets.AUTH_TOKEN }}
@@ -26,12 +26,8 @@ jobs:
             -H "Accept: application/json" \
             -H "x-xdr-auth-id: $AUTH_ID" \
             -H "Authorization: $AUTH_TOKEN")
-          
-          if [ "$(echo "$health_response" | jq -r '.status')" != "available" ]; then
-            echo "Healthcheck failed: $health_response"
-            exit 1
-          fi
-          echo "API healthy."
+          [ "$(echo "$health_response" | jq -r '.status')" != "available" ] && exit 1
+          echo "API status verified."
 
   distribution:
     needs: healthcheck
@@ -50,9 +46,9 @@ jobs:
             -H "x-xdr-auth-id: $AUTH_ID" \
             -H "Authorization: $AUTH_TOKEN" -d '{}')
           
-          latest_agent_version=$(echo "$agent_versions" | jq -r ".reply.\"$OS_TYPE\"[]" | tail -n 1)
+          latest_ver=$(echo "$agent_versions" | jq -r ".reply.\"$OS_TYPE\"[]" | tail -n 1)
           
-          PAYLOAD=$(jq -n --arg pipe "$GITHUB_RUN_ID" --arg ver "$latest_agent_version" \
+          PAYLOAD=$(jq -n --arg pipe "$GITHUB_RUN_ID" --arg ver "$latest_ver" \
             '{request_data: {name: ("GH-" + $pipe), package_type: "kubernetes", agent_version: $ver, deployment_platform: "standard", default_namespace: "cortex-xdr", run_on_all_nodes: true, run_on_master_node: true}}')
           
           dist_res=$(curl -s -X POST "$XDR_URL/public_api/v1/distributions/create" \
@@ -61,8 +57,7 @@ jobs:
             -H "Authorization: $AUTH_TOKEN" -d "$PAYLOAD")
           
           dist_id=$(echo "$dist_res" | jq -r '.reply.distribution_id // empty')
-          
-          echo "Waiting 120s for backend..." && sleep 120
+          sleep 120
           
           url_response=$(curl -s -X POST "$XDR_URL/public_api/v1/distributions/get_dist_url" \
             -H "Content-Type: application/json" \
@@ -73,11 +68,12 @@ jobs:
           dist_url=$(echo "$url_response" | jq -r '.reply.distribution_url // empty')
           curl --fail -L -X POST "$dist_url" -H "x-xdr-auth-id: $AUTH_ID" -H "Authorization: $AUTH_TOKEN" -o "$PACKAGE_NAME"
 
-      - name: Upload Artifact
+      - name: Upload Package
         uses: actions/upload-artifact@v4
         with:
           name: xdr-package
           path: ${{ env.PACKAGE_NAME }}
+          retention-days: 1 # Minimizes the time the sensitive YAML stays in GitHub storage
 
   deploy:
     needs: distribution
@@ -107,7 +103,7 @@ jobs:
           project_id: ${{ vars.GCP_PROJECT_NAME }}
 
       - name: Apply XDR configurations
+          # The file itself contains sensitive connection info, so we apply and don't log it
         run: |
-          kubectl create namespace cortex-xdr --dry-run=client -o yaml | kubectl apply -f -
           kubectl apply -f "$PACKAGE_NAME"
           kubectl rollout status daemonset/cortex-agent -n cortex-xdr --timeout=150s
