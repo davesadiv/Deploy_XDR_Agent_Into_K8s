@@ -1,4 +1,4 @@
-name: XDR GKE Deployment
+name: XDR GKE Deployment (Helm)
 
 on:
   push:
@@ -8,7 +8,7 @@ on:
 env:
   REGION: "us-central1"
   OS_TYPE: "linux"
-  PACKAGE_NAME: "xdrdaemonset.yaml"
+  PACKAGE_NAME: "cortex-xdr-chart.tgz" # Updated to reflect Helm archive
 
 jobs:
   healthcheck:
@@ -17,7 +17,6 @@ jobs:
     steps:
       - name: XDR API Healthcheck
         env:
-          # Mapping secrets as ENV vars keeps them out of the log command history
           XDR_URL: ${{ secrets.XDR_URL }}
           AUTH_ID: ${{ secrets.AUTH_ID }}
           AUTH_TOKEN: ${{ secrets.AUTH_TOKEN }}
@@ -34,13 +33,14 @@ jobs:
     runs-on: ubuntu-latest
     environment: Cortex
     steps:
-      - name: Generate XDR Package
+      - name: Generate XDR Helm Chart
         env:
           XDR_URL: ${{ secrets.XDR_URL }}
           AUTH_ID: ${{ secrets.AUTH_ID }}
           AUTH_TOKEN: ${{ secrets.AUTH_TOKEN }}
         run: |
           set -e
+          # 1. Get Latest Version
           agent_versions=$(curl -s -X POST "$XDR_URL/public_api/v1/distributions/get_versions" \
             -H "Content-Type: application/json" \
             -H "x-xdr-auth-id: $AUTH_ID" \
@@ -48,8 +48,9 @@ jobs:
           
           latest_ver=$(echo "$agent_versions" | jq -r ".reply.\"$OS_TYPE\"[]" | tail -n 1)
           
+          # 2. Create Distribution (Switched to package_type: helm)
           PAYLOAD=$(jq -n --arg pipe "$GITHUB_RUN_ID" --arg ver "$latest_ver" \
-            '{request_data: {name: ("GH-" + $pipe), package_type: "kubernetes", agent_version: $ver, deployment_platform: "standard", default_namespace: "cortex-xdr", run_on_all_nodes: true, run_on_master_node: true}}')
+            '{request_data: {name: ("GH-" + $pipe), package_type: "helm", agent_version: $ver, deployment_platform: "standard", default_namespace: "cortex-xdr"}}')
           
           dist_res=$(curl -s -X POST "$XDR_URL/public_api/v1/distributions/create" \
             -H "Content-Type: application/json" \
@@ -57,33 +58,40 @@ jobs:
             -H "Authorization: $AUTH_TOKEN" -d "$PAYLOAD")
           
           dist_id=$(echo "$dist_res" | jq -r '.reply.distribution_id // empty')
+          
+          echo "Waiting 120s for Helm chart generation..."
           sleep 120
           
+          # 3. Get Dist URL (Switched to package_type: helm)
           url_response=$(curl -s -X POST "$XDR_URL/public_api/v1/distributions/get_dist_url" \
             -H "Content-Type: application/json" \
             -H "x-xdr-auth-id: $AUTH_ID" \
             -H "Authorization: $AUTH_TOKEN" \
-            -d "{\"request_data\": {\"distribution_id\": \"$dist_id\", \"package_type\": \"yaml\"}}")
+            -d "{\"request_data\": {\"distribution_id\": \"$dist_id\", \"package_type\": \"helm\"}}")
           
           dist_url=$(echo "$url_response" | jq -r '.reply.distribution_url // empty')
+          
+          # Masking the signed URL for security
+          echo "::add-mask::$dist_url"
+          
           curl --fail -L -X POST "$dist_url" -H "x-xdr-auth-id: $AUTH_ID" -H "Authorization: $AUTH_TOKEN" -o "$PACKAGE_NAME"
 
-      - name: Upload Package
+      - name: Upload Helm Chart
         uses: actions/upload-artifact@v4
         with:
-          name: xdr-package
+          name: xdr-helm-package
           path: ${{ env.PACKAGE_NAME }}
-          retention-days: 1 # Minimizes the time the sensitive YAML stays in GitHub storage
+          retention-days: 1
 
   deploy:
     needs: distribution
     runs-on: ubuntu-latest
     environment: Cortex
     steps:
-      - name: Download Package
+      - name: Download Helm Chart
         uses: actions/download-artifact@v4
         with:
-          name: xdr-package
+          name: xdr-helm-package
 
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v2
@@ -102,24 +110,26 @@ jobs:
           location: ${{ env.REGION }}
           project_id: ${{ vars.GCP_PROJECT_NAME }}
 
-      - name: Apply XDR configurations
+      - name: Deploy via Helm
         run: |
-          kubectl create namespace cortex-xdr --dry-run=client -o yaml | kubectl apply -f - --insecure-skip-tls-verify
-          kubectl apply -f "$PACKAGE_NAME" --insecure-skip-tls-verify
+          # Create namespace if it doesn't exist
+          kubectl create namespace cortex-xdr --dry-run=client -o yaml | kubectl apply -f -
           
-          echo "Waiting 60s for initial stabilization..."
-          sleep 60
+          # Helm upgrade/install handles the DaemonSet logic
+          helm upgrade --install cortex-xdr-agent ./${{ env.PACKAGE_NAME }} \
+            --namespace cortex-xdr \
+            --wait \
+            --timeout 5m
           
           echo "Checking Pod Status..."
-          kubectl get pods -n cortex-xdr --insecure-skip-tls-verify
+          kubectl get pods -n cortex-xdr
           
-          # This logic counts how many pods are actually "1/1" (Ready)
-          READY_COUNT=$(kubectl get pods -n cortex-xdr --insecure-skip-tls-verify --no-headers | grep "1/1" | wc -l)
+          READY_COUNT=$(kubectl get pods -n cortex-xdr --no-headers | grep "1/1" | wc -l)
           
           if [ "$READY_COUNT" -gt 0 ]; then
-            echo "✅ Success: $READY_COUNT XDR agent(s) are Ready and Running."
+            echo "Success: $READY_COUNT XDR agent(s) are Ready and Running."
           else
-            echo "❌ Error: No agents reached Ready status. Check events/logs."
-            kubectl get events -n cortex-xdr --sort-by='.lastTimestamp' --insecure-skip-tls-verify | tail -n 5
+            echo "Error: Agents failed to reach Ready status."
+            kubectl get events -n cortex-xdr --sort-by='.lastTimestamp' | tail -n 5
             exit 1
           fi
