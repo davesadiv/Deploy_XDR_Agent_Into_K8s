@@ -1,4 +1,7 @@
-name: XDR GKE Helm Deployment (Final)
+## ##########################################################
+## XDR GKE HELM DEPLOYMENT WORKFLOW
+## ##########################################################
+name: XDR GKE Helm Deployment
 
 on:
   push:
@@ -11,7 +14,36 @@ env:
   PACKAGE_NAME: "cortex-xdr-chart.tgz"
 
 jobs:
+  ## ##########################################################
+  ## JOB 1: Healthcheck - Validates XDR API Availability
+  ## ##########################################################
+  healthcheck:
+    runs-on: ubuntu-latest
+    environment: Cortex
+    steps:
+      - name: XDR API Healthcheck
+        env:
+          XDR_URL: ${{ secrets.XDR_URL }}
+          AUTH_ID: ${{ secrets.AUTH_ID }}
+          AUTH_TOKEN: ${{ secrets.AUTH_TOKEN }}
+        run: |
+          health_response=$(curl -s "$XDR_URL/public_api/v1/healthcheck" \
+            -H "Accept: application/json" \
+            -H "x-xdr-auth-id: $AUTH_ID" \
+            -H "Authorization: $AUTH_TOKEN")
+          
+          STATUS=$(echo "$health_response" | jq -r '.status // empty')
+          if [ "$STATUS" != "available" ]; then
+            echo "❌ API Healthcheck Failed: $health_response"
+            exit 1
+          fi
+          echo "✅ XDR API status verified: $STATUS"
+
+  ## ##########################################################
+  ## JOB 2: Distribution - Generates and Polls for Helm Chart
+  ## ##########################################################
   distribution:
+    needs: healthcheck
     runs-on: ubuntu-latest
     environment: Cortex
     steps:
@@ -23,12 +55,13 @@ jobs:
         run: |
           set -e
           
-          # 1. Get Latest Version
+          # 1. Fetch Latest Version
           agent_versions=$(curl -s -X POST "$XDR_URL/public_api/v1/distributions/get_versions" \
             -H "Content-Type: application/json" -H "x-xdr-auth-id: $AUTH_ID" -H "Authorization: $AUTH_TOKEN" -d '{}')
           latest_ver=$(echo "$agent_versions" | jq -r ".reply.\"$OS_TYPE\"[]" | tail -n 1)
+          echo "Targeting Version: $latest_ver"
           
-          # 2. Create Distribution (As seen in your screenshot)
+          # 2. Create Distribution (Aligned with your successful UI entries)
           PAYLOAD=$(jq -n --arg pipe "$GITHUB_RUN_ID" --arg ver "$latest_ver" \
             '{request_data: {
               name: ("GH-HELM-" + $pipe), 
@@ -42,19 +75,22 @@ jobs:
             -H "Content-Type: application/json" -H "x-xdr-auth-id: $AUTH_ID" -H "Authorization: $AUTH_TOKEN" -d "$PAYLOAD")
           
           dist_id=$(echo "$dist_res" | jq -r '.reply.distribution_id // empty')
+          
+          if [ -z "$dist_id" ] || [ "$dist_id" == "null" ]; then
+            echo "❌ Failed to create distribution. API Response: $dist_res"
+            exit 1
+          fi
           echo "✅ Created Distribution ID: $dist_id"
 
-          # 3. Polling for the URL
-          # Your screenshot shows it "Completes", but we need to wait for the download link to be generated
-          echo "Waiting for URL generation..."
+          # 3. Smart Polling for URL (Handles the 500 'Object not found' lag)
+          echo "Waiting for backend to generate the download link..."
           MAX_RETRIES=15
           dist_url=""
 
           for ((i=1; i<=MAX_RETRIES; i++)); do
-            echo "Attempt $i/$MAX_RETRIES: Checking for download link..."
-            sleep 40
+            echo "Attempt $i/$MAX_RETRIES: Checking chart readiness..."
+            sleep 45
             
-            # NOTE: For Helm installers, package_type here MUST be "helm"
             url_response=$(curl -s -X POST "$XDR_URL/public_api/v1/distributions/get_dist_url" \
               -H "Content-Type: application/json" -H "x-xdr-auth-id: $AUTH_ID" -H "Authorization: $AUTH_TOKEN" \
               -d "{\"request_data\": {\"distribution_id\": \"$dist_id\", \"package_type\": \"helm\"}}")
@@ -66,18 +102,24 @@ jobs:
               break
             fi
             
-            # Debugging the 500 error if it persists
-            ERR_MSG=$(echo "$url_response" | jq -r '.reply.err_extra // empty')
-            if [ -n "$ERR_MSG" ]; then echo "Backend status: $ERR_MSG"; fi
+            # Print status if it's still failing
+            ERR_CODE=$(echo "$url_response" | jq -r '.reply.err_code // empty')
+            if [ "$ERR_CODE" == "500" ]; then
+               echo "Backend is still preparing the 'Object'..."
+            fi
           done
 
           if [ -z "$dist_url" ] || [ "$dist_url" == "null" ]; then
-            echo "❌ Timeout: Backend shows 'Completed' in UI but didn't provide a link to the API."
+            echo "❌ Timeout: Backend failed to provide a link. Last response: $url_response"
             exit 1
           fi
           
+          # Mask and download
           echo "::add-mask::$dist_url"
-          curl --fail -L -X POST "$dist_url" -H "x-xdr-auth-id: $AUTH_ID" -H "Authorization: $AUTH_TOKEN" -o "$PACKAGE_NAME"
+          curl --fail -L -X POST "$dist_url" \
+            -H "x-xdr-auth-id: $AUTH_ID" \
+            -H "Authorization: $AUTH_TOKEN" \
+            -o "$PACKAGE_NAME"
 
       - name: Upload Helm Chart
         uses: actions/upload-artifact@v4
@@ -86,6 +128,9 @@ jobs:
           path: ${{ env.PACKAGE_NAME }}
           retention-days: 1
 
+  ## ##########################################################
+  ## JOB 3: Deploy - Connects to GKE and Installs via Helm
+  ## ##########################################################
   deploy:
     needs: distribution
     runs-on: ubuntu-latest
@@ -115,8 +160,22 @@ jobs:
 
       - name: Deploy via Helm
         run: |
+          # Create namespace if it doesn't exist
           kubectl create namespace cortex-xdr --dry-run=client -o yaml | kubectl apply -f -
+          
+          # Deploy using Helm
           helm upgrade --install cortex-xdr-agent ./${{ env.PACKAGE_NAME }} \
             --namespace cortex-xdr \
             --wait \
             --timeout 5m
+          
+          echo "✅ Deployment complete. Verifying pods..."
+          kubectl get pods -n cortex-xdr
+          
+          READY_COUNT=$(kubectl get pods -n cortex-xdr --no-headers | grep "1/1" | wc -l)
+          if [ "$READY_COUNT" -gt 0 ]; then
+            echo "Success: $READY_COUNT XDR agent(s) are Ready."
+          else
+            echo "❌ Error: Agents failed to stabilize."
+            exit 1
+          fi
