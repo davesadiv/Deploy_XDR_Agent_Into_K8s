@@ -28,10 +28,10 @@ jobs:
           
           STATUS=$(echo "$health_response" | jq -r '.status // empty')
           if [ "$STATUS" != "available" ]; then
-            echo "API Healthcheck Failed: $health_response"
+            echo "❌ API Healthcheck Failed: $health_response"
             exit 1
           fi
-          echo "API status verified: $STATUS"
+          echo "✅ API status verified: $STATUS"
 
   distribution:
     needs: healthcheck
@@ -53,14 +53,14 @@ jobs:
           echo "Latest version identified: $latest_ver"
           
           # 2. Create Distribution
-          # Added platform: kubernetes and deployment_platform: standard to fix 'Object not found' error
+          # Removed 'platform' to fix 400 error; added 'is_standard' for Helm compatibility
           PAYLOAD=$(jq -n --arg pipe "$GITHUB_RUN_ID" --arg ver "$latest_ver" \
             '{request_data: {
               name: ("GH-HELM-" + $pipe), 
-              platform: "kubernetes",
               package_type: "helm", 
               agent_version: $ver, 
               deployment_platform: "standard", 
+              is_standard: true,
               default_namespace: "cortex-xdr",
               run_on_all_nodes: true
             }}')
@@ -71,24 +71,39 @@ jobs:
           dist_id=$(echo "$dist_res" | jq -r '.reply.distribution_id // empty')
           
           if [ -z "$dist_id" ] || [ "$dist_id" == "null" ]; then
-            echo "Error: Failed to create distribution. API Response:"
+            echo "❌ Error: Failed to create distribution. API Response:"
             echo "$dist_res" | jq .
             exit 1
           fi
 
-          echo "Waiting 150s for Helm chart generation (Dist ID: $dist_id)..."
-          sleep 150
-          
-          # 3. Get Dist URL
-          url_response=$(curl -s -X POST "$XDR_URL/public_api/v1/distributions/get_dist_url" \
-            -H "Content-Type: application/json" -H "x-xdr-auth-id: $AUTH_ID" -H "Authorization: $AUTH_TOKEN" \
-            -d "{\"request_data\": {\"distribution_id\": \"$dist_id\", \"package_type\": \"helm\"}}")
-          
-          dist_url=$(echo "$url_response" | jq -r '.reply.distribution_url // empty')
-          
+          # 3. Smart Polling for URL retrieval
+          # Helm charts take time to generate; we check every 30s for up to 5 minutes
+          echo "Waiting for Helm chart generation (Dist ID: $dist_id)..."
+          MAX_RETRIES=10
+          RETRY_COUNT=0
+          dist_url=""
+
+          while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+            echo "Attempt $((RETRY_COUNT+1))/$MAX_RETRIES: Checking if chart is ready..."
+            sleep 30
+            
+            url_response=$(curl -s -X POST "$XDR_URL/public_api/v1/distributions/get_dist_url" \
+              -H "Content-Type: application/json" -H "x-xdr-auth-id: $AUTH_ID" -H "Authorization: $AUTH_TOKEN" \
+              -d "{\"request_data\": {\"distribution_id\": \"$dist_id\", \"package_type\": \"helm\"}}")
+            
+            dist_url=$(echo "$url_response" | jq -r '.reply.distribution_url // empty')
+            
+            if [ -n "$dist_url" ] && [ "$dist_url" != "null" ]; then
+              echo "✅ Distribution URL found!"
+              break
+            fi
+            
+            RETRY_COUNT=$((RETRY_COUNT+1))
+          done
+
           if [ -z "$dist_url" ] || [ "$dist_url" == "null" ]; then
-            echo "Error: XDR API could not find the Helm object. Full Response:"
-            echo "$url_response" | jq .
+            echo "❌ Error: Timed out waiting for Helm chart or XDR returned an error."
+            echo "Last API Response: $url_response"
             exit 1
           fi
           
@@ -150,9 +165,9 @@ jobs:
           READY_COUNT=$(kubectl get pods -n cortex-xdr --no-headers | grep "1/1" | wc -l)
           
           if [ "$READY_COUNT" -gt 0 ]; then
-            echo "Success: $READY_COUNT XDR agent(s) are Ready and Running."
+            echo "✅ Success: $READY_COUNT XDR agent(s) are Ready and Running."
           else
-            echo "Error: Agents failed to reach Ready status."
+            echo "❌ Error: Agents failed to reach Ready status."
             kubectl get events -n cortex-xdr --sort-by='.lastTimestamp' | tail -n 5
             exit 1
           fi
