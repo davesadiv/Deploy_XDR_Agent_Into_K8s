@@ -52,17 +52,14 @@ jobs:
           latest_ver=$(echo "$agent_versions" | jq -r ".reply.\"$OS_TYPE\"[]" | tail -n 1)
           echo "Latest version identified: $latest_ver"
           
-          # 2. Create Distribution
-          # Removed 'platform' to fix 400 error; added 'is_standard' for Helm compatibility
+          # 2. Create Distribution - Minimal Valid Payload
           PAYLOAD=$(jq -n --arg pipe "$GITHUB_RUN_ID" --arg ver "$latest_ver" \
             '{request_data: {
               name: ("GH-HELM-" + $pipe), 
               package_type: "helm", 
               agent_version: $ver, 
               deployment_platform: "standard", 
-              is_standard: true,
-              default_namespace: "cortex-xdr",
-              run_on_all_nodes: true
+              default_namespace: "cortex-xdr"
             }}')
           
           dist_res=$(curl -s -X POST "$XDR_URL/public_api/v1/distributions/create" \
@@ -76,15 +73,14 @@ jobs:
             exit 1
           fi
 
-          # 3. Smart Polling for URL retrieval
-          # Helm charts take time to generate; we check every 30s for up to 5 minutes
+          # 3. Smart Polling for URL (Solves 500 'Object not found' error)
           echo "Waiting for Helm chart generation (Dist ID: $dist_id)..."
-          MAX_RETRIES=10
+          MAX_RETRIES=12 # 12 * 30s = 6 minutes total timeout
           RETRY_COUNT=0
           dist_url=""
 
           while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
-            echo "Attempt $((RETRY_COUNT+1))/$MAX_RETRIES: Checking if chart is ready..."
+            echo "Attempt $((RETRY_COUNT+1))/$MAX_RETRIES: Checking chart readiness..."
             sleep 30
             
             url_response=$(curl -s -X POST "$XDR_URL/public_api/v1/distributions/get_dist_url" \
@@ -102,8 +98,7 @@ jobs:
           done
 
           if [ -z "$dist_url" ] || [ "$dist_url" == "null" ]; then
-            echo "❌ Error: Timed out waiting for Helm chart or XDR returned an error."
-            echo "Last API Response: $url_response"
+            echo "❌ Error: Timed out waiting for Helm chart. Last API Response: $url_response"
             exit 1
           fi
           
