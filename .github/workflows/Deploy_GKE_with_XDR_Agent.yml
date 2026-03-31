@@ -28,10 +28,10 @@ jobs:
           
           STATUS=$(echo "$health_response" | jq -r '.status // empty')
           if [ "$STATUS" != "available" ]; then
-            echo "❌ API Healthcheck Failed: $health_response"
+            echo "API Healthcheck Failed: $health_response"
             exit 1
           fi
-          echo "✅ API status verified: $STATUS"
+          echo "API status verified: $STATUS"
 
   distribution:
     needs: healthcheck
@@ -53,8 +53,17 @@ jobs:
           echo "Latest version identified: $latest_ver"
           
           # 2. Create Distribution
+          # Added platform: kubernetes and deployment_platform: standard to fix 'Object not found' error
           PAYLOAD=$(jq -n --arg pipe "$GITHUB_RUN_ID" --arg ver "$latest_ver" \
-            '{request_data: {name: ("GH-" + $pipe), package_type: "helm", agent_version: $ver, deployment_platform: "standard", default_namespace: "cortex-xdr"}}')
+            '{request_data: {
+              name: ("GH-HELM-" + $pipe), 
+              platform: "kubernetes",
+              package_type: "helm", 
+              agent_version: $ver, 
+              deployment_platform: "standard", 
+              default_namespace: "cortex-xdr",
+              run_on_all_nodes: true
+            }}')
           
           dist_res=$(curl -s -X POST "$XDR_URL/public_api/v1/distributions/create" \
             -H "Content-Type: application/json" -H "x-xdr-auth-id: $AUTH_ID" -H "Authorization: $AUTH_TOKEN" -d "$PAYLOAD")
@@ -62,13 +71,13 @@ jobs:
           dist_id=$(echo "$dist_res" | jq -r '.reply.distribution_id // empty')
           
           if [ -z "$dist_id" ] || [ "$dist_id" == "null" ]; then
-            echo "❌ Error: Failed to create distribution. API Response:"
+            echo "Error: Failed to create distribution. API Response:"
             echo "$dist_res" | jq .
             exit 1
           fi
 
-          echo "Waiting 120s for Helm chart generation (Dist ID: $dist_id)..."
-          sleep 120
+          echo "Waiting 150s for Helm chart generation (Dist ID: $dist_id)..."
+          sleep 150
           
           # 3. Get Dist URL
           url_response=$(curl -s -X POST "$XDR_URL/public_api/v1/distributions/get_dist_url" \
@@ -78,13 +87,12 @@ jobs:
           dist_url=$(echo "$url_response" | jq -r '.reply.distribution_url // empty')
           
           if [ -z "$dist_url" ] || [ "$dist_url" == "null" ]; then
-            echo "❌ Error: Distribution URL is empty. The package might not be ready yet."
-            echo "API Response:"
+            echo "Error: XDR API could not find the Helm object. Full Response:"
             echo "$url_response" | jq .
             exit 1
           fi
           
-          # Mask for security and download
+          # Mask and download
           echo "::add-mask::$dist_url"
           curl --fail -L -X POST "$dist_url" \
             -H "x-xdr-auth-id: $AUTH_ID" \
@@ -130,7 +138,7 @@ jobs:
           # Create namespace if it doesn't exist
           kubectl create namespace cortex-xdr --dry-run=client -o yaml | kubectl apply -f -
           
-          # Helm install/upgrade
+          # Helm upgrade/install
           helm upgrade --install cortex-xdr-agent ./${{ env.PACKAGE_NAME }} \
             --namespace cortex-xdr \
             --wait \
@@ -142,9 +150,9 @@ jobs:
           READY_COUNT=$(kubectl get pods -n cortex-xdr --no-headers | grep "1/1" | wc -l)
           
           if [ "$READY_COUNT" -gt 0 ]; then
-            echo "✅ Success: $READY_COUNT XDR agent(s) are Ready and Running."
+            echo "Success: $READY_COUNT XDR agent(s) are Ready and Running."
           else
-            echo "❌ Error: Agents failed to reach Ready status."
+            echo "Error: Agents failed to reach Ready status."
             kubectl get events -n cortex-xdr --sort-by='.lastTimestamp' | tail -n 5
             exit 1
           fi
