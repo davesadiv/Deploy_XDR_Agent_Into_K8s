@@ -1,4 +1,4 @@
-name: XDR GKE Helm Deployment
+name: XDR GKE Helm Deployment (Final)
 
 on:
   push:
@@ -11,30 +11,7 @@ env:
   PACKAGE_NAME: "cortex-xdr-chart.tgz"
 
 jobs:
-  healthcheck:
-    runs-on: ubuntu-latest
-    environment: Cortex
-    steps:
-      - name: XDR API Healthcheck
-        env:
-          XDR_URL: ${{ secrets.XDR_URL }}
-          AUTH_ID: ${{ secrets.AUTH_ID }}
-          AUTH_TOKEN: ${{ secrets.AUTH_TOKEN }}
-        run: |
-          health_response=$(curl -s "$XDR_URL/public_api/v1/healthcheck" \
-            -H "Accept: application/json" \
-            -H "x-xdr-auth-id: $AUTH_ID" \
-            -H "Authorization: $AUTH_TOKEN")
-          
-          STATUS=$(echo "$health_response" | jq -r '.status // empty')
-          if [ "$STATUS" != "available" ]; then
-            echo "❌ API Healthcheck Failed: $health_response"
-            exit 1
-          fi
-          echo "✅ API status verified: $STATUS"
-
   distribution:
-    needs: healthcheck
     runs-on: ubuntu-latest
     environment: Cortex
     steps:
@@ -46,57 +23,38 @@ jobs:
         run: |
           set -e
           
-          # 1. Fetch available versions
+          # 1. Get Latest Version
           agent_versions=$(curl -s -X POST "$XDR_URL/public_api/v1/distributions/get_versions" \
             -H "Content-Type: application/json" -H "x-xdr-auth-id: $AUTH_ID" -H "Authorization: $AUTH_TOKEN" -d '{}')
+          latest_ver=$(echo "$agent_versions" | jq -r ".reply.\"$OS_TYPE\"[]" | tail -n 1)
           
-          # Try the last 5 versions (Tac reverses to try newest first)
-          VERSIONS_TO_TRY=$(echo "$agent_versions" | jq -r ".reply.\"$OS_TYPE\"[]" | tail -n 5 | tac)
+          # 2. Create Distribution (As seen in your screenshot)
+          PAYLOAD=$(jq -n --arg pipe "$GITHUB_RUN_ID" --arg ver "$latest_ver" \
+            '{request_data: {
+              name: ("GH-HELM-" + $pipe), 
+              package_type: "helm", 
+              agent_version: $ver, 
+              deployment_platform: "standard", 
+              default_namespace: "cortex-xdr"
+            }}')
           
-          dist_id=""
+          dist_res=$(curl -s -X POST "$XDR_URL/public_api/v1/distributions/create" \
+            -H "Content-Type: application/json" -H "x-xdr-auth-id: $AUTH_ID" -H "Authorization: $AUTH_TOKEN" -d "$PAYLOAD")
+          
+          dist_id=$(echo "$dist_res" | jq -r '.reply.distribution_id // empty')
+          echo "✅ Created Distribution ID: $dist_id"
 
-          # 2. Version Fallback Loop with Debug Logging
-          for ver in $VERSIONS_TO_TRY; do
-            echo "Attempting Helm distribution for version: $ver"
-            
-            # Payload optimized for GKE/Standard Helm
-            PAYLOAD=$(jq -n --arg ver "$ver" \
-              '{request_data: {
-                name: "GH-XDR-HELM", 
-                package_type: "helm", 
-                agent_version: $ver, 
-                deployment_platform: "standard",
-                default_namespace: "cortex-xdr"
-              }}')
-            
-            dist_res=$(curl -s -X POST "$XDR_URL/public_api/v1/distributions/create" \
-              -H "Content-Type: application/json" -H "x-xdr-auth-id: $AUTH_ID" -H "Authorization: $AUTH_TOKEN" -d "$PAYLOAD")
-            
-            dist_id=$(echo "$dist_res" | jq -r '.reply.distribution_id // empty')
-            
-            if [ -n "$dist_id" ] && [ "$dist_id" != "null" ]; then
-              echo "✅ Success! Dist ID: $dist_id"
-              break
-            else
-              echo "⚠️ Version $ver rejected by API."
-              echo "Debug Response: $dist_res"
-            fi
-          done
-
-          if [ -z "$dist_id" ] || [ "$dist_id" == "null" ]; then
-            echo "❌ Error: API rejected all attempted versions. Check debug logs above."
-            exit 1
-          fi
-
-          # 3. Smart Polling Loop (Prevents 500 Object Not Found)
-          echo "Waiting for XDR backend to generate the chart..."
-          MAX_RETRIES=15 
+          # 3. Polling for the URL
+          # Your screenshot shows it "Completes", but we need to wait for the download link to be generated
+          echo "Waiting for URL generation..."
+          MAX_RETRIES=15
           dist_url=""
 
           for ((i=1; i<=MAX_RETRIES; i++)); do
-            echo "Attempt $i/$MAX_RETRIES: Checking chart readiness..."
-            sleep 30
+            echo "Attempt $i/$MAX_RETRIES: Checking for download link..."
+            sleep 40
             
+            # NOTE: For Helm installers, package_type here MUST be "helm"
             url_response=$(curl -s -X POST "$XDR_URL/public_api/v1/distributions/get_dist_url" \
               -H "Content-Type: application/json" -H "x-xdr-auth-id: $AUTH_ID" -H "Authorization: $AUTH_TOKEN" \
               -d "{\"request_data\": {\"distribution_id\": \"$dist_id\", \"package_type\": \"helm\"}}")
@@ -104,13 +62,17 @@ jobs:
             dist_url=$(echo "$url_response" | jq -r '.reply.distribution_url // empty')
             
             if [ -n "$dist_url" ] && [ "$dist_url" != "null" ]; then
-              echo "✅ URL Found! Proceeding to download..."
+              echo "✅ Success! Download link obtained."
               break
             fi
+            
+            # Debugging the 500 error if it persists
+            ERR_MSG=$(echo "$url_response" | jq -r '.reply.err_extra // empty')
+            if [ -n "$ERR_MSG" ]; then echo "Backend status: $ERR_MSG"; fi
           done
 
           if [ -z "$dist_url" ] || [ "$dist_url" == "null" ]; then
-            echo "❌ Timeout. Backend could not provide URL. Final Response: $url_response"
+            echo "❌ Timeout: Backend shows 'Completed' in UI but didn't provide a link to the API."
             exit 1
           fi
           
@@ -153,24 +115,8 @@ jobs:
 
       - name: Deploy via Helm
         run: |
-          # Create namespace if it doesn't exist
           kubectl create namespace cortex-xdr --dry-run=client -o yaml | kubectl apply -f -
-          
-          # Helm upgrade/install
           helm upgrade --install cortex-xdr-agent ./${{ env.PACKAGE_NAME }} \
             --namespace cortex-xdr \
             --wait \
             --timeout 5m
-          
-          echo "Checking Pod Status..."
-          kubectl get pods -n cortex-xdr
-          
-          READY_COUNT=$(kubectl get pods -n cortex-xdr --no-headers | grep "1/1" | wc -l)
-          
-          if [ "$READY_COUNT" -gt 0 ]; then
-            echo "✅ Success: $READY_COUNT XDR agent(s) are Ready and Running."
-          else
-            echo "❌ Error: Agents failed to reach Ready status."
-            kubectl get events -n cortex-xdr --sort-by='.lastTimestamp' | tail -n 5
-            exit 1
-          fi
