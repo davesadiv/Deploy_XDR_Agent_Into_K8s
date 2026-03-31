@@ -64,7 +64,7 @@ jobs:
             PAYLOAD=$(jq -n --arg pipe "$GITHUB_RUN_ID" --arg ver "$ver" \
               '{request_data: {
                 name: ("GH-HELM-" + $pipe), 
-                package_type: "sh", 
+                package_type: "HELM_INSTALLER", 
                 agent_version: $ver, 
                 deployment_platform: "standard", 
                 default_namespace: "cortex-xdr"
