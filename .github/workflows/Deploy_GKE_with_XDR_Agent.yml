@@ -47,26 +47,25 @@ jobs:
           set -e
           
           # 1. Fetch available versions
-          echo "Fetching available agent versions..."
           agent_versions=$(curl -s -X POST "$XDR_URL/public_api/v1/distributions/get_versions" \
             -H "Content-Type: application/json" -H "x-xdr-auth-id: $AUTH_ID" -H "Authorization: $AUTH_TOKEN" -d '{}')
           
-          # Try the last 3 versions (tac reverses the list to try newest first)
-          VERSIONS_TO_TRY=$(echo "$agent_versions" | jq -r ".reply.\"$OS_TYPE\"[]" | tail -n 3 | tac)
+          # Try the last 5 versions (Tac reverses to try newest first)
+          VERSIONS_TO_TRY=$(echo "$agent_versions" | jq -r ".reply.\"$OS_TYPE\"[]" | tail -n 5 | tac)
           
           dist_id=""
-          selected_ver=""
 
-          # 2. Version Fallback Loop
+          # 2. Version Fallback Loop with Debug Logging
           for ver in $VERSIONS_TO_TRY; do
-            echo "Attempting to initialize Helm distribution for version: $ver"
+            echo "Attempting Helm distribution for version: $ver"
             
-            PAYLOAD=$(jq -n --arg pipe "$GITHUB_RUN_ID" --arg ver "$ver" \
+            # Payload optimized for GKE/Standard Helm
+            PAYLOAD=$(jq -n --arg ver "$ver" \
               '{request_data: {
-                name: ("GH-HELM-" + $pipe), 
-                package_type: "HELM_INSTALLER", 
+                name: "GH-XDR-HELM", 
+                package_type: "helm", 
                 agent_version: $ver, 
-                deployment_platform: "standard", 
+                deployment_platform: "standard",
                 default_namespace: "cortex-xdr"
               }}')
             
@@ -76,26 +75,27 @@ jobs:
             dist_id=$(echo "$dist_res" | jq -r '.reply.distribution_id // empty')
             
             if [ -n "$dist_id" ] && [ "$dist_id" != "null" ]; then
-              selected_ver=$ver
-              echo "✅ Distribution created successfully for $selected_ver (ID: $dist_id)"
+              echo "✅ Success! Dist ID: $dist_id"
               break
+            else
+              echo "⚠️ Version $ver rejected by API."
+              echo "Debug Response: $dist_res"
             fi
-            echo "⚠️ Version $ver failed to initialize. Trying previous version..."
           done
 
           if [ -z "$dist_id" ] || [ "$dist_id" == "null" ]; then
-            echo "❌ Error: Could not initialize Helm distribution for any recent versions."
+            echo "❌ Error: API rejected all attempted versions. Check debug logs above."
             exit 1
           fi
 
-          # 3. Smart Polling for URL retrieval
-          echo "Waiting for Helm chart generation (Dist ID: $dist_id)..."
-          MAX_RETRIES=10
+          # 3. Smart Polling Loop (Prevents 500 Object Not Found)
+          echo "Waiting for XDR backend to generate the chart..."
+          MAX_RETRIES=15 
           dist_url=""
 
           for ((i=1; i<=MAX_RETRIES; i++)); do
             echo "Attempt $i/$MAX_RETRIES: Checking chart readiness..."
-            sleep 45
+            sleep 30
             
             url_response=$(curl -s -X POST "$XDR_URL/public_api/v1/distributions/get_dist_url" \
               -H "Content-Type: application/json" -H "x-xdr-auth-id: $AUTH_ID" -H "Authorization: $AUTH_TOKEN" \
@@ -104,28 +104,18 @@ jobs:
             dist_url=$(echo "$url_response" | jq -r '.reply.distribution_url // empty')
             
             if [ -n "$dist_url" ] && [ "$dist_url" != "null" ]; then
-              echo "✅ Distribution URL found!"
+              echo "✅ URL Found! Proceeding to download..."
               break
-            fi
-            
-            # Catching if the API explicitly errors out during polling
-            ERR_MSG=$(echo "$url_response" | jq -r '.reply.err_msg // empty')
-            if [ -n "$ERR_MSG" ] && [[ "$ERR_MSG" != *"Unexpected error"* ]]; then
-               echo "❌ Backend error encountered: $ERR_MSG"
             fi
           done
 
           if [ -z "$dist_url" ] || [ "$dist_url" == "null" ]; then
-            echo "❌ Error: Timed out waiting for Helm chart. Last Response: $url_response"
+            echo "❌ Timeout. Backend could not provide URL. Final Response: $url_response"
             exit 1
           fi
           
-          # Mask and download
           echo "::add-mask::$dist_url"
-          curl --fail -L -X POST "$dist_url" \
-            -H "x-xdr-auth-id: $AUTH_ID" \
-            -H "Authorization: $AUTH_TOKEN" \
-            -o "$PACKAGE_NAME"
+          curl --fail -L -X POST "$dist_url" -H "x-xdr-auth-id: $AUTH_ID" -H "Authorization: $AUTH_TOKEN" -o "$PACKAGE_NAME"
 
       - name: Upload Helm Chart
         uses: actions/upload-artifact@v4
