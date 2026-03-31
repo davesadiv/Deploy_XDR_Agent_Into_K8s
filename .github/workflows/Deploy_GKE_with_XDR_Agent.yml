@@ -89,7 +89,7 @@ jobs:
 
           for ((i=1; i<=MAX_RETRIES; i++)); do
             echo "Attempt $i/$MAX_RETRIES: Checking chart readiness..."
-            sleep 45
+            sleep 120
             
             url_response=$(curl -s -X POST "$XDR_URL/public_api/v1/distributions/get_dist_url" \
               -H "Content-Type: application/json" -H "x-xdr-auth-id: $AUTH_ID" -H "Authorization: $AUTH_TOKEN" \
