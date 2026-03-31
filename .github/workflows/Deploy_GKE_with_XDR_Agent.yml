@@ -46,42 +46,56 @@ jobs:
         run: |
           set -e
           
-          # 1. Get Latest Version
+          # 1. Fetch available versions
+          echo "Fetching available agent versions..."
           agent_versions=$(curl -s -X POST "$XDR_URL/public_api/v1/distributions/get_versions" \
             -H "Content-Type: application/json" -H "x-xdr-auth-id: $AUTH_ID" -H "Authorization: $AUTH_TOKEN" -d '{}')
-          latest_ver=$(echo "$agent_versions" | jq -r ".reply.\"$OS_TYPE\"[]" | tail -n 1)
-          echo "Latest version identified: $latest_ver"
           
-          # 2. Create Distribution - Minimal Valid Payload
-          PAYLOAD=$(jq -n --arg pipe "$GITHUB_RUN_ID" --arg ver "$latest_ver" \
-            '{request_data: {
-              name: ("GH-HELM-" + $pipe), 
-              package_type: "helm", 
-              agent_version: $ver, 
-              deployment_platform: "standard", 
-              default_namespace: "cortex-xdr"
-            }}')
+          # Try the last 3 versions (tac reverses the list to try newest first)
+          VERSIONS_TO_TRY=$(echo "$agent_versions" | jq -r ".reply.\"$OS_TYPE\"[]" | tail -n 3 | tac)
           
-          dist_res=$(curl -s -X POST "$XDR_URL/public_api/v1/distributions/create" \
-            -H "Content-Type: application/json" -H "x-xdr-auth-id: $AUTH_ID" -H "Authorization: $AUTH_TOKEN" -d "$PAYLOAD")
-          
-          dist_id=$(echo "$dist_res" | jq -r '.reply.distribution_id // empty')
-          
+          dist_id=""
+          selected_ver=""
+
+          # 2. Version Fallback Loop
+          for ver in $VERSIONS_TO_TRY; do
+            echo "Attempting to initialize Helm distribution for version: $ver"
+            
+            PAYLOAD=$(jq -n --arg pipe "$GITHUB_RUN_ID" --arg ver "$ver" \
+              '{request_data: {
+                name: ("GH-HELM-" + $pipe), 
+                package_type: "helm", 
+                agent_version: $ver, 
+                deployment_platform: "standard", 
+                default_namespace: "cortex-xdr"
+              }}')
+            
+            dist_res=$(curl -s -X POST "$XDR_URL/public_api/v1/distributions/create" \
+              -H "Content-Type: application/json" -H "x-xdr-auth-id: $AUTH_ID" -H "Authorization: $AUTH_TOKEN" -d "$PAYLOAD")
+            
+            dist_id=$(echo "$dist_res" | jq -r '.reply.distribution_id // empty')
+            
+            if [ -n "$dist_id" ] && [ "$dist_id" != "null" ]; then
+              selected_ver=$ver
+              echo "✅ Distribution created successfully for $selected_ver (ID: $dist_id)"
+              break
+            fi
+            echo "⚠️ Version $ver failed to initialize. Trying previous version..."
+          done
+
           if [ -z "$dist_id" ] || [ "$dist_id" == "null" ]; then
-            echo "❌ Error: Failed to create distribution. API Response:"
-            echo "$dist_res" | jq .
+            echo "❌ Error: Could not initialize Helm distribution for any recent versions."
             exit 1
           fi
 
-          # 3. Smart Polling for URL (Solves 500 'Object not found' error)
+          # 3. Smart Polling for URL retrieval
           echo "Waiting for Helm chart generation (Dist ID: $dist_id)..."
-          MAX_RETRIES=12 # 12 * 30s = 6 minutes total timeout
-          RETRY_COUNT=0
+          MAX_RETRIES=10
           dist_url=""
 
-          while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
-            echo "Attempt $((RETRY_COUNT+1))/$MAX_RETRIES: Checking chart readiness..."
-            sleep 30
+          for ((i=1; i<=MAX_RETRIES; i++)); do
+            echo "Attempt $i/$MAX_RETRIES: Checking chart readiness..."
+            sleep 45
             
             url_response=$(curl -s -X POST "$XDR_URL/public_api/v1/distributions/get_dist_url" \
               -H "Content-Type: application/json" -H "x-xdr-auth-id: $AUTH_ID" -H "Authorization: $AUTH_TOKEN" \
@@ -94,11 +108,15 @@ jobs:
               break
             fi
             
-            RETRY_COUNT=$((RETRY_COUNT+1))
+            # Catching if the API explicitly errors out during polling
+            ERR_MSG=$(echo "$url_response" | jq -r '.reply.err_msg // empty')
+            if [ -n "$ERR_MSG" ] && [[ "$ERR_MSG" != *"Unexpected error"* ]]; then
+               echo "❌ Backend error encountered: $ERR_MSG"
+            fi
           done
 
           if [ -z "$dist_url" ] || [ "$dist_url" == "null" ]; then
-            echo "❌ Error: Timed out waiting for Helm chart. Last API Response: $url_response"
+            echo "❌ Error: Timed out waiting for Helm chart. Last Response: $url_response"
             exit 1
           fi
           
