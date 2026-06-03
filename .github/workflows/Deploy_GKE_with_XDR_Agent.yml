@@ -9,7 +9,7 @@ env:
   REGION: "us-central1"
   OS_TYPE: "linux"
   PACKAGE_NAME: "cortex-xdr-chart.tgz"
-
+#jobs
 jobs:
   healthcheck:
     runs-on: ubuntu-latest
