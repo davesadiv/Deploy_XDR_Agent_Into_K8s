@@ -54,10 +54,10 @@ jobs:
           echo "Found latest version: $latest_ver"
           
           # 2. Create Distribution
+          # Note: 'platform' is excluded here because package_type 'helm' handles it implicitly
           PAYLOAD=$(jq -n --arg ver "$latest_ver" \
             '{request_data: {
               name: "GH-TEST-HELM", 
-              platform: "linux",
               package_type: "helm", 
               agent_version: $ver, 
               deployment_platform: "standard",
