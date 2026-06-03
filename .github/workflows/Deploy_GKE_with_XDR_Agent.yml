@@ -53,16 +53,18 @@ jobs:
           latest_ver=$(echo "$agent_versions" | jq -r ".reply.\"$OS_TYPE\"[]" | tail -n 1)
           echo "Found latest version: $latest_ver"
           
-          # 2. Create Distribution
-          # Note: 'platform' must be set to 'helm' when creating a helm package type
+          # 2. Create Distribution 
+          # Fix: package_type must be 'standalone' when utilizing platform: 'helm'
           PAYLOAD=$(jq -n --arg ver "$latest_ver" \
             '{request_data: {
               name: "GH-TEST-HELM", 
+              package_type: "standalone",
               platform: "helm",
-              package_type: "helm", 
               agent_version: $ver, 
               deployment_platform: "standard",
-              default_namespace: "cortex-xdr"
+              default_namespace: "cortex-xdr",
+              run_on_master_node: false,
+              run_on_all_nodes: true
             }}')
           
           dist_res=$(curl -s -X POST "$XDR_URL/public_api/v1/distributions/create" \
