@@ -54,10 +54,11 @@ jobs:
           echo "Found latest version: $latest_ver"
           
           # 2. Create Distribution
+          # Note: 'platform' must be set to 'helm' when creating a helm package type
           PAYLOAD=$(jq -n --arg ver "$latest_ver" \
             '{request_data: {
               name: "GH-TEST-HELM", 
-              platform: "linux",
+              platform: "helm",
               package_type: "helm", 
               agent_version: $ver, 
               deployment_platform: "standard",
@@ -103,7 +104,7 @@ jobs:
           fi
           
           echo "::add-mask::$dist_url"
-          # Download using GET without Cortex Auth Headers (it is a pre-signed cloud storage URL)
+          # Download using GET without Cortex Auth Headers (pre-signed storage link)
           curl --fail -L "$dist_url" -o "$PACKAGE_NAME"
 
       - name: Upload Chart
@@ -139,7 +140,6 @@ jobs:
       - name: Deploy via Helm
         run: |
           kubectl create namespace cortex-xdr --dry-run=client -o yaml | kubectl apply -f -
-          # The artifact downloads directly into the current directory as 'cortex-xdr-chart.tgz'
           helm upgrade --install cortex-xdr-agent "${{ env.PACKAGE_NAME }}" \
             --namespace cortex-xdr \
             --wait
