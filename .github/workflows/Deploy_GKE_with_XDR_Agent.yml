@@ -9,7 +9,7 @@ env:
   REGION: "us-central1"
   OS_TYPE: "linux"
   PACKAGE_NAME: "cortex-xdr-chart.tgz"
-#jobs
+
 jobs:
   healthcheck:
     runs-on: ubuntu-latest
@@ -22,8 +22,14 @@ jobs:
           AUTH_TOKEN: ${{ secrets.AUTH_TOKEN }}
         run: |
           health_response=$(curl -s "$XDR_URL/public_api/v1/healthcheck" \
-            -H "Accept: application/json" -H "x-xdr-auth-id: $AUTH_ID" -H "Authorization: $AUTH_TOKEN")
-          [ "$(echo "$health_response" | jq -r '.status')" != "available" ] && exit 1
+            -H "Accept: application/json" \
+            -H "x-xdr-auth-id: $AUTH_ID" \
+            -H "Authorization: $AUTH_TOKEN")
+          
+          if [ "$(echo "$health_response" | jq -r '.status')" != "available" ]; then
+            echo "❌ XDR API is unavailable: $health_response"
+            exit 1
+          fi
 
   distribution:
     needs: healthcheck
@@ -40,11 +46,14 @@ jobs:
           
           # 1. Fetch versions
           agent_versions=$(curl -s -X POST "$XDR_URL/public_api/v1/distributions/get_versions" \
-            -H "Content-Type: application/json" -H "x-xdr-auth-id: $AUTH_ID" -H "Authorization: $AUTH_TOKEN" -d '{}')
+            -H "Content-Type: application/json" \
+            -H "x-xdr-auth-id: $AUTH_ID" \
+            -H "Authorization: $AUTH_TOKEN" -d '{}')
+          
           latest_ver=$(echo "$agent_versions" | jq -r ".reply.\"$OS_TYPE\"[]" | tail -n 1)
+          echo "Found latest version: $latest_ver"
           
           # 2. Create Distribution
-          # Note: 'platform' must be linux, 'package_type' must be helm
           PAYLOAD=$(jq -n --arg ver "$latest_ver" \
             '{request_data: {
               name: "GH-TEST-HELM", 
@@ -56,20 +65,29 @@ jobs:
             }}')
           
           dist_res=$(curl -s -X POST "$XDR_URL/public_api/v1/distributions/create" \
-            -H "Content-Type: application/json" -H "x-xdr-auth-id: $AUTH_ID" -H "Authorization: $AUTH_TOKEN" -d "$PAYLOAD")
+            -H "Content-Type: application/json" \
+            -H "x-xdr-auth-id: $AUTH_ID" \
+            -H "Authorization: $AUTH_TOKEN" -d "$PAYLOAD")
+            
           dist_id=$(echo "$dist_res" | jq -r '.reply.distribution_id // empty')
           
+          if [ -z "$dist_id" ]; then
+            echo "❌ Failed to create distribution: $dist_res"
+            exit 1
+          fi
           echo "✅ Distribution Initiated: $dist_id"
-
+          
           # 3. Polling for URL
-          # IMPORTANT: For Helm distributions, package_type in this call must be "helm"
           MAX_RETRIES=15
           dist_url=""
           for ((i=1; i<=MAX_RETRIES; i++)); do
             echo "Attempt $i/$MAX_RETRIES: Checking for Helm Object..."
             sleep 40
+            
             url_response=$(curl -s -X POST "$XDR_URL/public_api/v1/distributions/get_dist_url" \
-              -H "Content-Type: application/json" -H "x-xdr-auth-id: $AUTH_ID" -H "Authorization: $AUTH_TOKEN" \
+              -H "Content-Type: application/json" \
+              -H "x-xdr-auth-id: $AUTH_ID" \
+              -H "Authorization: $AUTH_TOKEN" \
               -d "{\"request_data\": {\"distribution_id\": \"$dist_id\", \"package_type\": \"helm\"}}")
             
             dist_url=$(echo "$url_response" | jq -r '.reply.distribution_url // empty')
@@ -78,14 +96,15 @@ jobs:
               break
             fi
           done
-
+          
           if [ -z "$dist_url" ]; then
             echo "❌ Failed to retrieve Helm URL. Response: $url_response"
             exit 1
           fi
           
           echo "::add-mask::$dist_url"
-          curl --fail -L -X POST "$dist_url" -H "x-xdr-auth-id: $AUTH_ID" -H "Authorization: $AUTH_TOKEN" -o "$PACKAGE_NAME"
+          # Download using GET without Cortex Auth Headers (it is a pre-signed cloud storage URL)
+          curl --fail -L "$dist_url" -o "$PACKAGE_NAME"
 
       - name: Upload Chart
         uses: actions/upload-artifact@v4
@@ -103,12 +122,13 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: xdr-helm-package
+          path: .
 
-      - name: Authenticate & Get GKE Credentials
+      - name: Authenticate to GCP
         uses: google-github-actions/auth@v2
         with:
           credentials_json: ${{ secrets.GCP_KEY }}
-      
+
       - name: Get GKE Credentials
         uses: google-github-actions/get-gke-credentials@v2
         with:
@@ -119,6 +139,7 @@ jobs:
       - name: Deploy via Helm
         run: |
           kubectl create namespace cortex-xdr --dry-run=client -o yaml | kubectl apply -f -
-          helm upgrade --install cortex-xdr-agent ./${{ env.PACKAGE_NAME }} \
+          # The artifact downloads directly into the current directory as 'cortex-xdr-chart.tgz'
+          helm upgrade --install cortex-xdr-agent "${{ env.PACKAGE_NAME }}" \
             --namespace cortex-xdr \
             --wait
